@@ -1,0 +1,29 @@
+# requirements.txt
+# Install with: pip install -r requirements.txt
+# After installing playwright, also run: playwright install chromium
+
+# HTTP requests and retry logic
+requests>=2.32
+
+# HTML parsing
+beautifulsoup4>=4.14
+lxml>=6.0           # faster HTML parser backend for BeautifulSoup
+
+# Browser automation (used by image_scraper.py for live page scraping)
+playwright>=1.56
+# After install, run: playwright install chromium
+
+# OpenAI API (alt text + aria label generation)
+openai>=1.0
+
+# Environment variable management
+python-dotenv>=1.2
+
+# Image compression before sending to OpenAI vision API
+Pillow>=10.0
+
+PyQt5>=5.15
+
+trafilatura>=1.6
+
+pandas
