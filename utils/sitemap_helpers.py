@@ -1,7 +1,9 @@
 # utils/sitemap_helpers.py
-# Fetch and parse XML sitemaps for UAlberta sites.
-# Handles sitemap indexes, gzip-compressed sitemaps, and the
-# /en/<site>/ path prefix convention.
+#
+# Fetch and parse XML sitemaps for UAlberta sites via BrowserSession.
+# All known UAlberta sitemaps are flat <urlset> documents (no sitemap indexes).
+
+from __future__ import annotations
 
 import gzip
 import xml.etree.ElementTree as ET
@@ -9,7 +11,7 @@ from io import BytesIO
 from typing import Optional
 from urllib.parse import urlparse
 
-from utils.http_helpers import SESSION, REQUEST_TIMEOUT, _get
+from utils.browser_helpers import BrowserSession
 
 
 def _live_site_root(site: str) -> str:
@@ -17,7 +19,6 @@ def _live_site_root(site: str) -> str:
 
 
 def _sitemap_url_candidates(site: str) -> list[str]:
-    """Try these URLs in order until one responds."""
     root = _live_site_root(site)
     return [
         f"{root}/sitemap.xml",
@@ -26,16 +27,44 @@ def _sitemap_url_candidates(site: str) -> list[str]:
     ]
 
 
-def _read_xml_bytes(resp) -> bytes:
-    """Handle gzip-compressed responses transparently."""
-    data = resp.content or b""
-    is_gzip = data.startswith(b"\x1f\x8b") or (resp.url or "").lower().endswith(".gz")
-    if is_gzip:
+def _to_xml_bytes(raw: bytes) -> Optional[bytes]:
+    """
+    Given raw bytes from the browser, return clean XML bytes or None.
+
+    Handles three cases:
+      1. Raw XML bytes straight off the wire  (ideal — get_bytes response listener)
+      2. Gzip-compressed XML
+      3. Chrome rendered the XML into HTML    (fallback — extract text from <pre>)
+    """
+    if not raw:
+        return None
+
+    # Decompress gzip if needed
+    if raw.startswith(b"\x1f\x8b"):
         try:
-            return gzip.GzipFile(fileobj=BytesIO(data)).read()
+            raw = gzip.GzipFile(fileobj=BytesIO(raw)).read()
         except OSError:
-            return data
-    return data
+            pass
+
+    stripped = raw.strip()
+
+    # Case 1: already valid XML
+    if stripped.startswith(b"<") and b"<urlset" in stripped[:500]:
+        return stripped
+
+    # Case 2: Chrome wrapped the XML in an HTML page (XML viewer or challenge page)
+    # Pull text out of <pre> tags (Chrome's XML viewer) or the whole body
+    if stripped.lower().startswith(b"<!doctype") or stripped.lower().startswith(b"<html"):
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(stripped, "html.parser")
+        pre  = soup.find("pre")
+        text = (pre.get_text() if pre else soup.get_text()).strip()
+        if text.startswith("<") and "<urlset" in text[:500]:
+            return text.encode("utf-8")
+        # Looks like a challenge / error page — not XML
+        return None
+
+    return None
 
 
 def _parse_urlset(xml_bytes: bytes) -> list[str]:
@@ -58,73 +87,85 @@ def _parse_sitemapindex(xml_bytes: bytes) -> list[str]:
     ]
 
 
-def _safe_parse_urlset(xml_bytes: bytes) -> list[str]:
-    """Parse a urlset, with a fallback decompression attempt on parse errors."""
-    try:
-        return _parse_urlset(xml_bytes)
-    except ET.ParseError:
-        try:
-            decompressed = gzip.GzipFile(fileobj=BytesIO(xml_bytes)).read()
-            return _parse_urlset(decompressed)
-        except Exception:
-            head = xml_bytes[:200].decode("utf-8", errors="replace")
-            raise RuntimeError(f"Sitemap is not valid XML. First 200 bytes:\n{head}")
-
-
-def fetch_sitemap_paths(site: str, debug: bool = False) -> list[str]:
+def fetch_sitemap_paths(
+    site:    str,
+    debug:   bool = False,
+    browser: Optional[BrowserSession] = None,
+) -> list[str]:
     """
-    Fetch the sitemap for a UAlberta site and return a list of relative page paths.
+    Fetch the sitemap for a UAlberta site and return relative page paths.
 
-    Paths are returned as '/some/page/path' (no .html, no host).
-    Handles both flat sitemaps and sitemap index files.
+    Args:
+        site:    Site slug, e.g. "human-resources-health-safety-environment"
+        debug:   Print extra diagnostics if True
+        browser: Open BrowserSession to reuse. Creates a temporary one if None.
 
+    Returns paths as '/some/page/path' (no .html, no host).
     Raises RuntimeError if no sitemap can be fetched.
     """
     base_path = f"/en/{site.strip().strip('/')}"
-    all_urls: list[str] = []
 
-    # Try each candidate URL until one works
-    raw_bytes: Optional[bytes] = None
-    used_url: Optional[str] = None
-    for cand in _sitemap_url_candidates(site):
-        try:
-            r = _get(cand, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+    def _do_fetch(b: BrowserSession) -> list[str]:
+        raw_bytes: Optional[bytes] = None
+        used_url:  Optional[str]   = None
+
+        for cand in _sitemap_url_candidates(site):
+            data = b.get_bytes(cand, delay=True)
+            xml  = _to_xml_bytes(data)
+
             if debug:
-                print(f"[DEBUG] Tried {cand} → {r.status_code} (final: {r.url})")
-            if r.status_code == 200 and r.content:
-                raw_bytes = _read_xml_bytes(r)
-                used_url = r.url
+                print(f"[DEBUG] {cand} → raw={len(data)}B  xml={'ok' if xml else 'None'}")
+                if not xml:
+                    print(f"[DEBUG] First 200B: {data[:200]}")
+
+            if xml:
+                raw_bytes = xml
+                used_url  = cand
                 break
-            else:
-                print(f"[WARN] {cand} returned {r.status_code} — trying next candidate")
-        except Exception as e:
-            print(f"[WARN] {cand} failed: {e} — trying next candidate")
-            continue
 
-    if raw_bytes is None:
-        raise RuntimeError(f"Could not fetch any sitemap for site '{site}' after trying all candidates.")
+            print(f"[WARN] {cand} — could not extract valid XML, trying next candidate")
 
-    xml = raw_bytes.strip()
-    head = xml[:2000].lower()
-    is_index = b"<sitemapindex" in head or b":sitemapindex" in head
+        if raw_bytes is None:
+            raise RuntimeError(
+                f"Could not fetch any sitemap for site '{site}' after trying all candidates."
+            )
 
-    if is_index:
-        # Sitemap index — fetch and combine all child sitemaps
-        children = _parse_sitemapindex(xml)
-        for child_url in children:
-            try:
-                rr = _get(child_url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
-                if rr.status_code != 200 or not rr.content:
-                    continue
-                all_urls.extend(_safe_parse_urlset(_read_xml_bytes(rr)))
-            except Exception:
-                continue
+        xml   = raw_bytes.strip()
+        head  = xml[:2000].lower()
+        is_index = b"<sitemapindex" in head or b":sitemapindex" in head
+
+        if debug:
+            print(f"[DEBUG] Sitemap source: {used_url}  is_index={is_index}")
+
+        all_urls: list[str] = []
+        if is_index:
+            children = _parse_sitemapindex(xml)
+            for child_url in children:
+                child_raw = b.get_bytes(child_url, delay=True)
+                child_xml = _to_xml_bytes(child_raw)
+                if child_xml:
+                    try:
+                        all_urls.extend(_parse_urlset(child_xml))
+                    except ET.ParseError:
+                        pass
+        else:
+            all_urls.extend(_parse_urlset(xml))
+
+        if debug:
+            print(f"[DEBUG] Total URLs in sitemap: {len(all_urls)}")
+
+        return all_urls
+
+    if browser is not None:
+        all_urls = _do_fetch(browser)
     else:
-        all_urls.extend(_safe_parse_urlset(xml))
+        with BrowserSession() as tmp:
+            all_urls = _do_fetch(tmp)
 
     # Convert full URLs to site-relative paths, deduplicated
     paths: list[str] = []
-    seen: set[str] = set()
+    seen:  set[str]  = set()
+
     for full_url in all_urls:
         try:
             pth = urlparse(full_url).path
@@ -133,7 +174,6 @@ def fetch_sitemap_paths(site: str, debug: bool = False) -> list[str]:
         if not pth.startswith(base_path):
             continue
         rel = pth[len(base_path):] or "/"
-        # Normalize: strip .html, ensure /index for root/trailing-slash
         if rel.endswith(".html"):
             rel = rel[:-5]
         if rel == "" or rel.endswith("/"):
@@ -145,7 +185,6 @@ def fetch_sitemap_paths(site: str, debug: bool = False) -> list[str]:
             paths.append(rel)
 
     if debug:
-        print(f"[DEBUG] Sitemap source: {used_url}")
-        print(f"[DEBUG] Total URLs in sitemap: {len(all_urls)}, paths kept for '{site}': {len(paths)}")
+        print(f"[DEBUG] Paths kept for '{site}': {len(paths)}")
 
     return paths

@@ -18,7 +18,6 @@ REQUEST_TIMEOUT = 30  # seconds
 _head_cache: dict[str, tuple[bool, Optional[int], Optional[str]]] = {}
 
 # Rotate through a handful of realistic Chrome user agent strings.
-# Using a single UA forever is a bot signal — rotating helps.
 _USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
@@ -27,13 +26,24 @@ _USER_AGENTS = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
 ]
 
+# How many times to retry a 202 before giving up.
+_MAX_202_RETRIES = 4
+
+# Base delay (seconds) for 202 retry backoff — doubles each attempt: 2, 4, 8, 16 s.
+_202_BACKOFF_BASE = 2.0
+
+# UAlberta root — hitting this seeds Akamai cookies for the whole session.
+_WARMUP_URL = "https://www.ualberta.ca/"
+_session_warmed_up = False
+
+# Module-level session — rebuilt by reset_session(); shared across all callers.
+# Declared as None here; assigned after make_session() is defined below.
+SESSION: requests.Session
+
 
 def make_session(total_retries: int = 5, backoff: float = 0.6) -> requests.Session:
     """
     Build a requests Session that mimics a real Chrome browser.
-
-    Uses a rotating user agent and the full set of headers a browser sends,
-    which avoids bot-detection filters that key on missing or suspicious headers.
     """
     s = requests.Session()
     retry = Retry(
@@ -50,7 +60,6 @@ def make_session(total_retries: int = 5, backoff: float = 0.6) -> requests.Sessi
     s.mount("http://", adapter)
     s.mount("https://", adapter)
 
-    # Full browser header set — missing any of these is a common bot signal
     s.headers.update({
         "User-Agent":                random.choice(_USER_AGENTS),
         "Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
@@ -70,17 +79,78 @@ def make_session(total_retries: int = 5, backoff: float = 0.6) -> requests.Sessi
     return s
 
 
+def reset_session() -> None:
+    """
+    Discard the current session and cookie jar and create a fresh one.
+
+    Akamai tracks session age and request count. After ~15 requests from the
+    same cookie jar it re-challenges the client. Resetting gives a clean slate
+    that the next warm_up_session() call can seed with fresh cookies.
+
+    Typical usage in a batch loop:
+        if idx % RESET_EVERY == 0:
+            reset_session()
+            warm_up_session()
+    """
+    global SESSION, _session_warmed_up
+    SESSION = make_session()
+    _session_warmed_up = False
+
+
+def warm_up_session() -> None:
+    """
+    Seed the session cookie jar by visiting the UAlberta root page.
+
+    Akamai sets trust cookies on the first visit. Without them every subsequent
+    request gets a 202 challenge page. No-op after the first successful call.
+    """
+    global _session_warmed_up
+    if _session_warmed_up:
+        return
+    try:
+        print(f"[INFO] Warming up session: {_WARMUP_URL}")
+        SESSION.headers.update({"User-Agent": random.choice(_USER_AGENTS)})
+        r = SESSION.get(_WARMUP_URL, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+        if r.status_code == 200:
+            print(f"[INFO] Session warmed up — {len(SESSION.cookies)} cookie(s) set")
+        else:
+            print(f"[WARN] Warm-up returned {r.status_code} — proceeding anyway")
+    except Exception as e:
+        print(f"[WARN] Warm-up request failed: {e} — proceeding anyway")
+    finally:
+        _session_warmed_up = True
+
+
 def _get(url: str, **kwargs) -> requests.Response:
     """
-    Make a GET request with a small random delay to avoid rate limiting.
-    Rotates the User-Agent header per request.
+    Make a GET request with a human-paced delay, retrying up to _MAX_202_RETRIES
+    times on Akamai 202 challenges with exponential backoff.
+
+    Inter-request delay is 1.5–4 s — slow enough that Akamai's behavioral
+    analysis doesn't flag a sustained machine-speed burst.
     """
     SESSION.headers.update({"User-Agent": random.choice(_USER_AGENTS)})
-    time.sleep(random.uniform(0.3, 0.9))
-    return SESSION.get(url, **kwargs)
+    time.sleep(random.uniform(1.5, 4.0))
+
+    resp = SESSION.get(url, **kwargs)
+
+    if resp.status_code != 202:
+        return resp
+
+    # 202 retry loop: 2 s, 4 s, 8 s, 16 s
+    for attempt in range(1, _MAX_202_RETRIES + 1):
+        wait = _202_BACKOFF_BASE * (2 ** (attempt - 1)) + random.uniform(0, 1)
+        print(f"  [202] {url} — retry {attempt}/{_MAX_202_RETRIES} in {wait:.1f}s")
+        time.sleep(wait)
+        SESSION.headers.update({"User-Agent": random.choice(_USER_AGENTS)})
+        resp = SESSION.get(url, **kwargs)
+        if resp.status_code != 202:
+            break
+
+    return resp
 
 
-# Module-level session — shared across all callers in a single run
+# Initialise the module-level session.
 SESSION = make_session()
 
 
@@ -134,9 +204,6 @@ def fetch_link_context(href: str) -> dict:
     """
     Fetch a link target page and return compact context for aria-label generation:
     final_url, title, og_title, h1, meta_desc.
-
-    Only attempts absolute http(s) URLs — returns empty fields for anything else.
-    Uses the shared SESSION so retries and headers are handled consistently.
     """
     from bs4 import BeautifulSoup
 
@@ -169,6 +236,6 @@ def fetch_link_context(href: str) -> dict:
             ctx["meta_desc"] = (md["content"] or "").strip()
 
     except Exception:
-        pass  # caller gets empty context — not a hard failure
+        pass
 
     return ctx

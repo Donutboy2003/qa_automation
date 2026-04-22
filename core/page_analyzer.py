@@ -2,7 +2,8 @@
 #
 # Analyze a single page's text content using an LLM with a configurable
 # output schema. Supports summary, CTA, theme, audience, keywords,
-# and relevance classification — all optional and independently toggled.
+# relevance classification, and audience classification — all optional and
+# independently toggled.
 #
 # Batch usage:
 #   from core.page_analyzer import analyze_page, AnalysisConfig
@@ -15,6 +16,15 @@
 #       classification_scale=4,
 #   )
 #   result = analyze_page(text="...", url="https://...", config=config)
+#
+# Audience classification usage:
+#   config = AnalysisConfig(
+#       include_summary=True,
+#       include_audience_classification=True,
+#   )
+#   result = analyze_page(text="...", url="https://...", config=config)
+#   # result keys: audience_classification, audience_confidence_score,
+#   #              audience_primary_indicators, audience_reasoning
 
 from __future__ import annotations
 
@@ -61,7 +71,7 @@ class AnalysisConfig:
     include_description:  bool = False
     """Short description for SEO/CMS use (≤30 words)."""
 
-    # ── Classification ────────────────────────────────────────────────────────
+    # ── Relevance classification ───────────────────────────────────────────────
     include_classification: bool = False
     """
     Score the page's relevance to a custom prompt.
@@ -82,8 +92,57 @@ class AnalysisConfig:
     include_classification_confidence:  bool = True
     """Include a confidence value (0.0–1.0) in the classification score."""
 
+    # ── Audience classification ────────────────────────────────────────────────
+    include_audience_classification: bool = False
+    """
+    Classify the page as Internal, External, Mixed, or Unclassified based on
+    its target audience — current students/staff vs. prospective/public audiences.
+
+    Output keys added to the result:
+      audience_classification      — "Internal" | "External" | "Mixed" | "Unclassified"
+      audience_confidence_score    — float 0.0–1.0
+      audience_primary_indicators  — list of 3 keyword/phrase strings that drove the decision
+      audience_reasoning           — one sentence explaining the classification
+    """
+
     # ── Model ─────────────────────────────────────────────────────────────────
     model: str = DEFAULT_MODEL
+
+
+# ── Audience classification prompt block ──────────────────────────────────────
+
+_AUDIENCE_CLASSIFICATION_INSTRUCTIONS = """\
+Audience classification:
+  Definitions:
+    INTERNAL — audience is current employees (support staff, researchers, instructors,
+      librarians, faculty) and/or current students navigating university processes,
+      accessing private services, HR forms, internal policy documents, or student portals.
+    EXTERNAL — audience is prospective students, prospective employees (job-seekers),
+      partners, funders (governments, donors), alumni, or the general public; purpose is
+      marketing, admissions, job listings, research impact, giving pages, or public services.
+    MIXED    — page intent is genuinely split; no single audience controls ≥80% of the content.
+    UNCLASSIFIED — insufficient information to make a determination.
+
+  Classification rules:
+    - Choose "Internal"  if >80% of the page targets current students or staff.
+    - Choose "External"  if >80% of the page targets prospective or public audiences.
+    - Choose "Mixed"     if no single audience controls ≥80%.
+    - Choose "Unclassified" only when the content is too sparse to decide.
+
+  Priority keyword signals:
+    Internal indicators : Canvas, Blackboard, Employee Benefits Portal, Faculty Handbook
+    External indicators : Apply Now, Donate, Alumni Association, Campus Tours
+
+  Identify exactly 3 keywords or phrases from the actual page content that most strongly
+  drove your classification decision (primary_indicators).
+"""
+
+_AUDIENCE_CLASSIFICATION_SCHEMA = """\
+  "audience_classification": string — one of: "Internal", "External", "Mixed", "Unclassified",
+  "audience_confidence_score": float 0.0–1.0 — confidence in the classification,
+  "audience_primary_indicators": array of exactly 3 strings — keywords/phrases from the content that drove the decision,
+  "audience_reasoning": string — one concise sentence explaining the classification\
+"""
 
 
 # ── Prompt builder ────────────────────────────────────────────────────────────
@@ -142,6 +201,10 @@ def _build_prompt(text: str, url: str, config: AnalysisConfig) -> str:
         if config.include_classification_confidence:
             schema_lines.append('"relevance_confidence": float 0.0–1.0 — how confident you are in the score')
 
+    if config.include_audience_classification:
+        instruction_lines.append(_AUDIENCE_CLASSIFICATION_INSTRUCTIONS)
+        schema_lines.append(_AUDIENCE_CLASSIFICATION_SCHEMA)
+
     if not schema_lines:
         raise ValueError("AnalysisConfig has no output fields enabled — turn on at least one")
 
@@ -188,6 +251,14 @@ def analyze_page(
             "title": str,           # if extractable from text
             "error": str | None,
             ...requested fields...
+        }
+
+        When include_audience_classification=True, the dict also contains:
+        {
+            "audience_classification":     str,   # Internal | External | Mixed | Unclassified
+            "audience_confidence_score":   float,
+            "audience_primary_indicators": list[str],
+            "audience_reasoning":          str,
         }
     """
     if config is None:

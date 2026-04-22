@@ -3,38 +3,50 @@
 # Extract clean readable text from a page, either by fetching the live URL
 # or by reading the Cascade page JSON.
 #
+# Live fetches use Playwright (real Chromium) so that Akamai JS challenges
+# are resolved naturally.  A BrowserSession must be passed in for live mode;
+# the caller (batch_analyzer) owns the session lifetime.
+#
 # Used by page_analyzer and batch_analyzer as the content source step.
 
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, Optional
 
 from bs4 import BeautifulSoup
 
 from utils.html_helpers import extract_html_snippets
-from utils.http_helpers import _get, REQUEST_TIMEOUT
 
 
 # ── Live URL extraction ───────────────────────────────────────────────────────
 
-def extract_text_from_url(url: str) -> dict[str, str]:
+def extract_text_from_url(url: str, browser=None) -> dict[str, str]:
     """
     Fetch a live page and extract clean text content.
 
-    Tries trafilatura first (best quality), falls back to BeautifulSoup.
+    Args:
+        url:     The page URL to fetch.
+        browser: A BrowserSession instance (from utils.browser_helpers).
+                 Required — raises RuntimeError if not provided.
+
     Returns a dict with keys: url, title, text, error.
     """
     result = {"url": url, "title": "", "text": "", "error": ""}
 
-    try:
-        resp = _get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
-        if resp.status_code != 200:
-            result["error"] = f"HTTP {resp.status_code}"
-            return result
-        html_text = resp.text
-    except Exception as e:
-        result["error"] = f"Fetch failed: {e}"
+    if browser is None:
+        result["error"] = "BrowserSession required for live extraction"
+        return result
+
+    html_text = browser.get_html(url)
+
+    if not html_text:
+        result["error"] = "Browser returned empty response"
+        return result
+
+    # Detect Akamai challenge pages that didn't resolve
+    if _is_challenge_page(html_text):
+        result["error"] = "Akamai challenge page — JS challenge did not resolve"
         return result
 
     # Try trafilatura first — best at extracting article-quality text
@@ -74,14 +86,32 @@ def extract_text_from_url(url: str) -> dict[str, str]:
     return result
 
 
+def _is_challenge_page(html: str) -> bool:
+    """
+    Return True if the HTML looks like an unresolved Akamai/CDN challenge page
+    rather than real content. Checks for known challenge signatures.
+    """
+    lower = html.lower()
+    signals = [
+        "you have been blocked",
+        "please enable cookies",
+        "checking your browser",
+        "ray id:",                   # Cloudflare challenge
+        "akamai-error",
+        "access denied",
+    ]
+    # Also flag pages with almost no content — challenge pages are typically tiny
+    text_length = len(BeautifulSoup(html, "html.parser").get_text())
+    if text_length < 200:
+        return True
+    return any(s in lower for s in signals)
+
+
 # ── Cascade JSON extraction ───────────────────────────────────────────────────
 
 def extract_text_from_cascade_json(page_json: dict[str, Any], url: str = "") -> dict[str, str]:
     """
     Extract clean text from a Cascade page JSON response.
-
-    Pulls all HTML snippets from the structured data, strips tags,
-    and joins into a single readable string.
 
     Returns a dict with keys: url, title, text, error.
     """
@@ -93,18 +123,14 @@ def extract_text_from_cascade_json(page_json: dict[str, Any], url: str = "") -> 
             result["error"] = "No HTML content found in page JSON"
             return result
 
-        # Pull title from metadata if available
         try:
             meta = page_json.get("asset", {}).get("page", {}).get("metadata", {})
             result["title"] = (
-                meta.get("title")
-                or meta.get("displayName")
-                or ""
+                meta.get("title") or meta.get("displayName") or ""
             ).strip()
         except Exception:
             pass
 
-        # Strip HTML tags from each snippet and join
         parts: list[str] = []
         for html_snippet in snippets:
             try:
@@ -126,18 +152,20 @@ def extract_text_from_cascade_json(page_json: dict[str, Any], url: str = "") -> 
 # ── Combined helper ───────────────────────────────────────────────────────────
 
 def extract_text(
-    source: str = "live",
-    url: str = "",
+    source:    str = "live",
+    url:       str = "",
     page_json: dict[str, Any] | None = None,
+    browser=None,
 ) -> dict[str, str]:
     """
     Extract page text from either a live URL or Cascade JSON.
 
     Args:
-        source:    "live" — fetch and parse the URL
+        source:    "live"    — fetch and parse the URL via Playwright
                    "cascade" — extract from page_json
-        url:       The page URL (used for live fetch, and as label for cascade)
+        url:       The page URL
         page_json: Cascade read response — required when source="cascade"
+        browser:   BrowserSession instance — required when source="live"
 
     Returns:
         Dict with keys: url, title, text, error
@@ -149,4 +177,4 @@ def extract_text(
     else:
         if not url:
             return {"url": "", "title": "", "text": "", "error": "url is required for live source"}
-        return extract_text_from_url(url)
+        return extract_text_from_url(url, browser=browser)
