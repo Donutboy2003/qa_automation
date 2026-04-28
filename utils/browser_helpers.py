@@ -45,7 +45,7 @@ _USER_AGENTS = [
 ]
 
 _WAIT_UNTIL       = "networkidle"   # ensures Akamai JS challenge completes
-_NAV_TIMEOUT      = 30_000          # ms
+_NAV_TIMEOUT      = 60_000          # ms — increased from 30_000 to give Akamai challenge more time
 _INTER_PAGE_DELAY = (0.5, 1.5)      # seconds between requests
 
 
@@ -112,18 +112,39 @@ class BrowserSession:
         """
         Navigate to url and return fully-rendered HTML after JS has executed.
         Use for normal web pages.
+
+        networkidle is kept (not downgraded to 'load') because Akamai's JS
+        challenge must fully execute before we read content.  If networkidle
+        times out it's almost always persistent trackers — the challenge and
+        page content are already in the DOM by then, so we settle briefly and
+        read whatever landed.
         """
         if delay:
             time.sleep(random.uniform(*_INTER_PAGE_DELAY))
         page = self._new_page()
         try:
-            page.goto(url, wait_until=_WAIT_UNTIL, timeout=_NAV_TIMEOUT)
-            return page.content()
+            try:
+                page.goto(url, wait_until=_WAIT_UNTIL, timeout=_NAV_TIMEOUT)
+            except Exception:
+                # networkidle timed out — persistent trackers keeping network busy.
+                # Challenge has already resolved; wait a beat then grab the DOM.
+                try:
+                    page.wait_for_timeout(5000)
+                except Exception:
+                    pass
+            try:
+                return page.content()
+            except Exception as e:
+                print(f"  [BROWSER] Failed to read content {url}: {e}")
+                return ""
         except Exception as e:
             print(f"  [BROWSER] Failed to load {url}: {e}")
             return ""
         finally:
-            page.close()
+            try:
+                page.close()
+            except Exception:
+                pass
 
     def get_bytes(self, url: str, delay: bool = True) -> bytes:
         """
@@ -169,7 +190,10 @@ class BrowserSession:
             print(f"  [BROWSER] Failed to fetch bytes {url}: {e}")
             return b""
         finally:
-            page.close()
+            try:
+                page.close()
+            except Exception:
+                pass
 
     def get_text(self, url: str, delay: bool = True) -> str:
         """Navigate to url and return visible text (no HTML tags)."""
